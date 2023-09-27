@@ -7,7 +7,8 @@ edition = "2021"
 
 [dependencies]
 glow = "0.12.3"
-imgui = { version = "0.11.0", features = ["tables-api"] }
+imgui = { version = "0.11.0", features = [] }
 imgui-glow-renderer = "0.11.0"
 imgui-sdl2-support = "0.11.0"
 sdl2 = "0.34.5"
+chess = { git = "https://github.com/INDA23PlusPlus/emilaa-chess" }

@@ -6,6 +6,7 @@ version = 3
 name = "albjorkm-chess-gui"
 version = "0.1.0"
 dependencies = [
+ "chess",
  "glow",
  "imgui",
  "imgui-glow-renderer",
@@ -51,6 +52,11 @@ name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+
+[[package]]
+name = "chess"
+version = "0.1.0"
+source = "git+https://github.com/INDA23PlusPlus/emilaa-chess#1aa0496e0fc9ede590e0df475958b311362d4a79"
 
 [[package]]
 name = "chlorine"
