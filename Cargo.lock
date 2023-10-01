@@ -56,7 +56,7 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 [[package]]
 name = "chess"
 version = "0.1.0"
-source = "git+https://github.com/INDA23PlusPlus/emilaa-chess#1aa0496e0fc9ede590e0df475958b311362d4a79"
+source = "git+https://github.com/INDA23PlusPlus/emilaa-chess#ff25e0cefb393bdd48f1224b96fbdfe308fd1e27"
 
 [[package]]
 name = "chlorine"

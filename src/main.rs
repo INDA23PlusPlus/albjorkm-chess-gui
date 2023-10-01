@@ -15,6 +15,7 @@ struct GameState {
     chess_representation: [(i8, i8); 64],
     moving_piece: usize,
     is_white_turn: bool,
+    is_promoting: bool,
 }
 
 impl GameState {
@@ -27,12 +28,26 @@ impl GameState {
             chess_representation,
             moving_piece: 65,
             is_white_turn: true,
+            is_promoting: false,
         }
     }
     fn do_move(self: &mut Self, from: usize, to: usize) {
+        if self.chess_board.game_end {
+            println!("The game is over, moving is not allowed");
+            return
+        }
+        if self.is_promoting {
+            println!("Please promote first");
+        }
         self.chess_board.move_by_index(from, to);
         self.chess_representation = self.chess_board.get_board();
         self.is_white_turn = !self.is_white_turn;
+        self.is_promoting = self.chess_board.can_promote()
+    }
+    fn promote(self: &mut Self, piece: i8) {
+        self.chess_board.promote(piece);
+        self.is_promoting = false;
+        self.chess_representation = self.chess_board.get_board();
     }
 }
 
@@ -126,14 +141,37 @@ fn draw_chess(ui: &imgui::Ui, game_state: &mut GameState) {
         };
         ui.text(t);
     }
+
+    if game_state.is_promoting {
+        let window = ui.window("Promotion")
+            .size([230., 0.], imgui::Condition::Always)
+            .flags(WindowFlags::NO_COLLAPSE);
+        if let Some(_t) = window.begin() {
+            if ui.button("\u{265C}") {
+                game_state.promote(2);
+            }
+            ui.same_line();
+            if ui.button("\u{265E}") {
+                game_state.promote(3);
+            }
+            ui.same_line();
+            if ui.button("\u{265D}") {
+                game_state.promote(4);
+            }
+            ui.same_line();
+            if ui.button("\u{265B}") {
+                game_state.promote(5);
+            }
+        }
+    }
 }
 
 fn draw_ui(ui: &imgui::Ui, game_state: &mut GameState) {
-    let window_token = ui.window("Chess")
+    let window = ui.window("Chess")
         .flags(WindowFlags::NO_DECORATION | WindowFlags::NO_BACKGROUND)
         .position([0., 0.], imgui::Condition::Always)
-        .size(ui.io().display_size, imgui::Condition::Always).begin();
-    if let Some(_t) = window_token {
+        .size(ui.io().display_size, imgui::Condition::Always);
+    if let Some(_t) = window.begin() {
         draw_chess(ui, game_state);
     }
 }
