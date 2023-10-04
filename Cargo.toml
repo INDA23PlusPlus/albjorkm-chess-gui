@@ -12,3 +12,4 @@ imgui-glow-renderer = "0.11.0"
 imgui-sdl2-support = "0.11.0"
 sdl2 = "0.34.5"
 chess = { git = "https://github.com/INDA23PlusPlus/emilaa-chess" }
+chess-network-protocol = { git = "https://github.com/INDA23PlusPlus/chess-network-protocol" }

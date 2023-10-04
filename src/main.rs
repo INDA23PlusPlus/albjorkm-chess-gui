@@ -32,7 +32,7 @@ impl GameState {
         }
     }
     fn do_move(self: &mut Self, from: usize, to: usize) {
-        if self.chess_board.game_end {
+        if self.chess_board.is_game_ended() {
             println!("The game is over, moving is not allowed");
             return
         }
@@ -128,7 +128,7 @@ fn draw_chess(ui: &imgui::Ui, game_state: &mut GameState) {
             game_state.moving_piece = 65;
         }
     }
-    if game_state.chess_board.game_end {
+    if game_state.chess_board.is_game_ended() {
         draw_list.add_text([cell_size * 4. - 150., cell_size * 4.], 0xFFFFFFFF, "IT'S SO OVER!");
         if ui.button("Restart") {
             *game_state = GameState::new_game();
