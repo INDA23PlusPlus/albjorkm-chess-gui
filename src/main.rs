@@ -1,6 +1,11 @@
 // The boilerplate code is shamelessly stolen from the imgui rust examples.
 // If you get a linking error, download SDL2.lib from the SDL website.
 
+use std::{io::Read, marker::PhantomData};
+
+use chess_network_protocol::{ClientToServerHandshake,
+                             ClientToServer, ServerToClient,
+                             ServerToClientHandshake};
 use glow::HasContext;
 use imgui::{Context, WindowFlags};
 use imgui_glow_renderer::AutoRenderer;
@@ -10,12 +15,21 @@ use sdl2::{
     video::{GLProfile, Window},
 };
 
+enum GameMode {
+    Undecided(String),
+    HostWaitForOpponent(std::net::TcpListener),
+    Host(std::net::TcpStream, JsonPoller<ClientToServerHandshake, ClientToServer>),
+    Client(std::net::TcpStream, JsonPoller<ServerToClientHandshake, ServerToClient>),
+    Local,
+}
+
 struct GameState {
     chess_board: chess::ChessBoard,
     chess_representation: [(i8, i8); 64],
     moving_piece: usize,
     is_white_turn: bool,
     is_promoting: bool,
+    mode: GameMode,
 }
 
 impl GameState {
@@ -29,6 +43,7 @@ impl GameState {
             moving_piece: 65,
             is_white_turn: true,
             is_promoting: false,
+            mode: GameMode::Undecided(String::from("localhost")),
         }
     }
     fn do_move(self: &mut Self, from: usize, to: usize) {
@@ -167,6 +182,46 @@ fn draw_chess(ui: &imgui::Ui, game_state: &mut GameState) {
 }
 
 fn draw_ui(ui: &imgui::Ui, game_state: &mut GameState) {
+    if let GameMode::Undecided(address) = &mut game_state.mode {
+        let window = ui.window("Select Mode")
+            .size([500., 0.], imgui::Condition::Once);
+        if let Some(_t) = window.begin() {
+            if ui.button("Local Play") {
+                game_state.mode = GameMode::Local;
+                return
+            }
+            if ui.button("Host Game") {
+                let listener = std::net::TcpListener::bind("127.0.0.1:8483")
+                    .unwrap();
+                listener.set_nonblocking(true).unwrap();
+                game_state.mode = GameMode::HostWaitForOpponent(listener);
+                return
+            }
+            let _ = ui.input_text("Address", address).build();
+            if ui.button("Join Game") {
+                let address = if address.contains(":") {
+                    address.clone()
+                } else {
+                    format!("{address}:8483")
+                };
+                println!("[client]attempting to connect to: {address}");
+                let stream = std::net::TcpStream::connect(address).unwrap();
+                stream.set_nonblocking(true);
+                game_state.mode = GameMode::Client(stream, JsonPoller::new());
+                return
+            }
+        }
+        return
+    }
+    if let GameMode::HostWaitForOpponent(_) = &mut game_state.mode {
+        let window = ui.window("Awaiting opponent!")
+            .size([500., 0.], imgui::Condition::Once);
+        if let Some(_t) = window.begin() {
+            ui.text("Please wait");
+        }
+        return
+    }
+
     let window = ui.window("Chess")
         .flags(WindowFlags::NO_DECORATION | WindowFlags::NO_BACKGROUND)
         .position([0., 0.], imgui::Condition::Always)
@@ -181,6 +236,123 @@ fn glow_context(window: &Window) -> glow::Context {
         glow::Context::from_loader_function(|s| window.subsystem().gl_get_proc_address(s) as _)
     }
 }
+
+enum JsonState {
+    Normal,
+    String,
+    StringEscape,
+}
+
+/// Because serde_json exposes no way to know when serialization ended we
+/// implement this ourselves.
+struct JsonFinder {
+    pub length: usize,
+    nesting: i32,
+    state: JsonState,
+}
+
+impl JsonFinder {
+    fn new() -> Self {
+        return JsonFinder {
+            length: 0,
+            nesting: 0,
+            state: JsonState::Normal,
+        }
+    }
+    fn reset(&mut self) {
+        self.length = 0;
+        self.nesting = 0;
+        self.state = JsonState::Normal;
+    }
+
+    /// Returns true once the finder has found a complete JSON object.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        for b in bytes {
+            match self.state {
+                JsonState::Normal => match b {
+                    b'"' => self.state = JsonState::String,
+                    b'{' => self.nesting += 1,
+                    b'}' => {
+                        self.nesting -= 1;
+                        if self.nesting <= 0 {
+                            return true;
+                        }
+                    },
+                    _ => {},
+                },
+                JsonState::StringEscape => self.state = JsonState::String,
+                JsonState::String => match b {
+                    b'"'  => self.state = JsonState::Normal,
+                    b'\\' => self.state = JsonState::StringEscape,
+                    _ => {}
+                }
+            }
+            self.length += 1;
+        }
+        false
+    }
+}
+
+struct JsonPoller<Handshake: serde::de::DeserializeOwned, Data: serde::de::DeserializeOwned> {
+    finder: JsonFinder,
+    buf: Vec<u8>,
+    handshake_complete: bool,
+    // This is done such that the compiler doesn't complain about unused
+    // generics
+    _phantom1: std::marker::PhantomData<*const Handshake>,
+    _phantom2: std::marker::PhantomData<*const Data>,
+
+}
+
+#[derive(Eq, PartialEq, Debug)]
+enum Packet<Handshake, Data> {
+    Handshake(Handshake),
+    Data(Data),
+}
+
+impl<Handshake: serde::de::DeserializeOwned, Data: serde::de::DeserializeOwned> JsonPoller<Handshake, Data> {
+    fn new() -> Self {
+        return JsonPoller::<Handshake, Data> {
+            finder: JsonFinder::new(),
+            buf: vec![],
+            handshake_complete: false,
+            _phantom1: PhantomData,
+            _phantom2: PhantomData,
+        }
+    }
+    fn feed(&mut self, data: &[u8]) -> Vec<Packet<Handshake, Data>> {
+        let start = self.buf.len();
+        self.buf.extend_from_slice(data);
+        //println!("feed: {:#?}", std::str::from_utf8(&self.buf));
+        let mut scan_slice = start .. self.buf.len();
+        let mut values = vec![];
+        while self.finder.feed(&self.buf[scan_slice.clone()]) {
+            let data = &self.buf[0..self.finder.length + 1];
+            //println!("data: {:#?}", std::str::from_utf8(data));
+            if self.handshake_complete {
+                match serde_json::from_slice(data) {
+                    Ok(v) => values.push(Packet::Data(v)),
+                    Err(e) => eprintln!("data parse error: {e}"),
+                }
+            } else {
+                self.handshake_complete = true;
+                match serde_json::from_slice(data) {
+                    Ok(v) => values.push(Packet::Handshake(v)),
+                    Err(e) => eprintln!("handshake parse error: {e}"),
+                }
+            };
+            let new_length = self.buf.len() - self.finder.length;
+            let slice = self.finder.length + 1 .. self.buf.len();
+            self.buf.copy_within(slice, 0);
+            self.buf.truncate(new_length);
+            self.finder.reset();
+            scan_slice = 0..new_length;
+            //println!("feed 2: {:#?}", std::str::from_utf8(&self.buf));
+        }
+        values
+    }
+}
+
 
 fn main() {
     let sdl = sdl2::init().unwrap();
@@ -237,6 +409,11 @@ fn main() {
 
     let mut game_state = GameState::new_game();
 
+    //let mut stream = std::net::TcpStream::connect("127.0.0.1:8483").unwrap();
+    /*stream.set_nonblocking(true).unwrap();*/
+
+    let mut buffer = [0u8; 65535];
+
     'main: loop {
         for event in event_pump.poll_iter() {
             platform.handle_event(&mut imgui, &event);
@@ -245,6 +422,32 @@ fn main() {
                 break 'main;
             }
         }
+
+        match &mut game_state.mode {
+            GameMode::HostWaitForOpponent(listener) => {
+                if let Ok((stream, _)) = listener.accept() {
+                    stream.set_nonblocking(true).unwrap();
+                    game_state.mode = GameMode::Host(stream, JsonPoller::new());
+                }
+            }
+            GameMode::Host(stream, poller) => {
+                let buffer_read = stream.read(&mut buffer).unwrap_or_default();
+                let packets = poller.feed(&buffer[0..buffer_read]);
+                for packet in packets {
+                    println!("[server] packet received {packet:#?}");
+                }
+            }
+            GameMode::Client(stream, poller) => {
+                let buffer_read = stream.read(&mut buffer).unwrap_or_default();
+                let packets = poller.feed(&buffer[0..buffer_read]);
+                for packet in packets {
+                    println!("[client] packet received {packet:#?}");
+                }
+
+            }
+            GameMode::Undecided(_) | GameMode::Local => {}
+        }
+
 
         platform.prepare_frame(&mut imgui, &window, &event_pump);
 
@@ -264,5 +467,44 @@ fn main() {
 
         window.gl_swap_window();
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{JsonFinder, JsonPoller, Packet};
+    use serde::Deserialize;
+
+    #[test]
+    pub fn json_finder() {
+        let mut finder = JsonFinder::new();
+        assert_eq!(finder.feed(b"{\"hi\": 3"), false);
+        assert_eq!(finder.feed(b"2 } excess data here"), true);
+        assert_eq!(finder.length, 10);
+
+        finder.reset();
+        assert_eq!(finder.feed(b"{\"hi\": \""), false);
+        assert_eq!(finder.feed(b"s\\\\t\\\"r\" } excess data here"), true);
+        assert_eq!(finder.length, 17);
+    }
+
+    #[derive(Deserialize, Debug, Eq, PartialEq)]
+    struct TestStruct {
+        hi: String,
+    }
+
+    #[test]
+    pub fn json_poller() {
+        let mut poller  = JsonPoller::<TestStruct, TestStruct>::new();
+        assert_eq!(poller.feed(b"{\"hi\": \""), vec![]);
+        assert_eq!(poller.feed(b"s\\\\t\\\"r\" }{\"hi\": \"hey\"}"), vec![
+            Packet::Handshake(TestStruct  {
+                hi: "s\\t\"r".into(),
+            }),
+            Packet::Data(TestStruct {
+                hi: "hey".into(),
+            })
+        ]);
+        assert_eq!(poller.feed(b" "), vec![]);
     }
 }

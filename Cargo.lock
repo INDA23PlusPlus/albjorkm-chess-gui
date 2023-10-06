@@ -13,6 +13,8 @@ dependencies = [
  "imgui-glow-renderer",
  "imgui-sdl2-support",
  "sdl2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
