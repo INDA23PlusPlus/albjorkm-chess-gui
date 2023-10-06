@@ -7,6 +7,7 @@ use chess_network_protocol::{ClientToServerHandshake,
                              ClientToServer, ServerToClient,
                              ServerToClientHandshake,
                              Piece, Move, Joever};
+use chess_network_protocol::Color::White;
 use glow::HasContext;
 use imgui::{Context, WindowFlags};
 use imgui_glow_renderer::AutoRenderer;
@@ -93,30 +94,41 @@ struct ChessState {
     is_white_turn: bool,
     is_promoting: bool,
     is_game_over: bool,
+    is_client: bool,
     unsent_net_move: UnsentNetMove,
 }
 
 impl ChessState {
     fn do_move(self: &mut Self, from: usize, to: usize) -> bool {
-        if self.chess_board.is_game_ended() {
+        if self.is_game_over {
             println!("The game is over, moving is not allowed");
             return false
         }
         if self.is_promoting {
             println!("Please promote first");
         }
-        if self.chess_board.move_by_index(from, to) {
+
+        let to_rank = to >> 3;
+
+        let net_move = Move {
+            end_y: 7 - to_rank,
+            end_x: to & 7,
+            start_y: 7 - (from >> 3),
+            start_x: from & 7,
+            promotion: Piece::None,
+        };
+
+        let mut did_move = false;
+
+        if self.is_client {
+            self.is_promoting = self.chess_representation[from].0 == 1 &&
+                (to_rank == 0 || to_rank == 7);
+            did_move = true;
+        } else if self.chess_board.move_by_index(from, to) {
             self.chess_representation = self.chess_board.get_board();
             self.is_white_turn = !self.is_white_turn;
             self.is_promoting = self.chess_board.can_promote();
 
-            let net_move = Move {
-                end_x: to & 7,
-                end_y: to >> 3,
-                start_x: from & 7,
-                start_y: from >> 3,
-                promotion: Piece::None,
-            };
 
             self.unsent_net_move = if self.is_promoting {
                 // If we are promoting, we don't want to send the
@@ -127,15 +139,28 @@ impl ChessState {
             };
 
             self.is_game_over = self.chess_board.is_game_ended();
-            return true;
+            did_move = true;
         }
-        false
+
+        if did_move {
+            self.unsent_net_move = if self.is_promoting {
+                // If we are promoting, we don't want to send the
+                // update just yet.
+                UnsentNetMove::PendingPromotion(net_move)
+            } else {
+                UnsentNetMove::Unsent(net_move)
+            };
+        }
+
+        did_move
     }
     fn promote(self: &mut Self, piece: i8) {
         self.chess_board.promote(piece);
         self.is_promoting = false;
-        self.chess_representation = self.chess_board.get_board();
-        self.is_game_over = self.chess_board.is_game_ended();
+        if !self.is_client {
+            self.chess_representation = self.chess_board.get_board();
+            self.is_game_over = self.chess_board.is_game_ended();
+        }
         let UnsentNetMove::PendingPromotion(mut mv)
             = self.unsent_net_move else {
             panic!("promote() called with bad unsent_net_move value");
@@ -146,8 +171,8 @@ impl ChessState {
     }
     fn ingest_client_move(self: &mut Self, mv: &Move)
         -> bool {
-        let from = mv.start_y << 3 |  mv.start_x;
-        let to = mv.end_y << 3 |  mv.end_x;
+        let from = (7 - mv.start_y) << 3 | mv.start_x;
+        let to = (7 - mv.end_y) << 3 | mv.end_x;
         let result = self.do_move(from, to);
         if self.is_promoting {
             let piece = match mv.promotion {
@@ -176,6 +201,7 @@ impl ChessState {
 struct GameState {
     chess_state: ChessState,
     mode: GameMode,
+    host_is_white: bool,
 }
 
 impl GameState {
@@ -192,8 +218,10 @@ impl GameState {
                 is_white_turn: true,
                 is_promoting: false,
                 is_game_over: false,
+                is_client: false,
             },
             mode: GameMode::Undecided(String::from("localhost")),
+            host_is_white: true,
         }
     }
 }
@@ -217,7 +245,7 @@ fn team_to_color(team: i8) -> [f32; 4] {
     if team == 1 { [1.0, 0.0, 1.0, 1.0 ] } else { [1.0, 1.0, 0.0, 1.0] }
 }
 
-fn draw_chess(ui: &imgui::Ui, chess_state: &mut ChessState) {
+fn draw_chess(ui: &imgui::Ui, chess_state: &mut ChessState, can_move: bool) {
     let display_size = ui.io().display_size;
     let cell_size = (display_size[0].min(display_size[1]) / 8.).round() - 10.;
     let draw_list = ui.get_window_draw_list();
@@ -250,6 +278,10 @@ fn draw_chess(ui: &imgui::Ui, chess_state: &mut ChessState) {
         let fg_color = team_to_color(team);
         let _color_stck = ui.push_style_color(imgui::StyleColor::Text, fg_color);
         ui.button_with_size(piece_unicode, [cell_size, cell_size]);
+
+        if !can_move {
+            continue
+        }
 
         if let Some(_) = ui.drag_drop_source_config("move").begin_payload(i) {
             chess_state.moving_piece = i;
@@ -333,7 +365,7 @@ fn draw_ui(ui: &imgui::Ui, game_state: &mut GameState) {
                 } else {
                     format!("{address}:8483")
                 };
-                println!("[client]attempting to connect to: {address}");
+                println!("[client] attempting to connect to: {address}");
                 let stream = std::net::TcpStream::connect(address).unwrap();
                 stream.set_nonblocking(true).unwrap();
 
@@ -363,7 +395,15 @@ fn draw_ui(ui: &imgui::Ui, game_state: &mut GameState) {
         .position([0., 0.], imgui::Condition::Always)
         .size(ui.io().display_size, imgui::Condition::Always);
     if let Some(_t) = window.begin() {
-        draw_chess(ui, &mut game_state.chess_state);
+        // Moves can be made if it is the turn of the host. Or we are not
+        // running as a host.
+        let is_whites_turn = game_state.chess_state.is_white_turn;
+        let can_move = match game_state.mode {
+            GameMode::Host(..) => game_state.host_is_white == is_whites_turn,
+            _ => true
+        };
+
+        draw_chess(ui, &mut game_state.chess_state, can_move);
 
         if game_state.chess_state.is_game_over {
             if ui.button("Restart") {
@@ -469,11 +509,12 @@ impl<Handshake: serde::de::DeserializeOwned,
     fn feed(&mut self, data: &[u8], into: &mut Vec<Packet<Handshake, Data>>) {
         let start = self.buf.len();
         self.buf.extend_from_slice(data);
-        println!("feed: {:#?}", std::str::from_utf8(&self.buf));
+        //println!("feed: {:#?}", std::str::from_utf8(&self.buf));
         let mut scan_slice = start .. self.buf.len();
+        //println!("scan: {:#?}", scan_slice);
         while self.finder.feed(&self.buf[scan_slice.clone()]) {
             let data = &self.buf[0..self.finder.length + 1];
-            println!("data: {:#?}", std::str::from_utf8(data));
+            //println!("data: {:#?}", std::str::from_utf8(data));
             if self.handshake_complete {
                 match serde_json::from_slice(data) {
                     Ok(v) => into.push(Packet::Data(v)),
@@ -486,13 +527,14 @@ impl<Handshake: serde::de::DeserializeOwned,
                     Err(e) => eprintln!("handshake parse error: {e}"),
                 }
             };
-            let new_length = self.buf.len() - self.finder.length;
+            let new_length = self.buf.len() - self.finder.length - 1;
+            //println!("new_length: {new_length}");
             let slice = self.finder.length + 1 .. self.buf.len();
             self.buf.copy_within(slice, 0);
             self.buf.truncate(new_length);
             self.finder.reset();
             scan_slice = 0..new_length;
-            println!("feed 2: {:#?}", std::str::from_utf8(&self.buf));
+            //println!("feed 2: {:#?}", std::str::from_utf8(&self.buf));
         }
     }
 }
@@ -515,6 +557,7 @@ fn send_server_handshake(stream: &mut std::net::TcpStream,
 fn handle_client_move(stream: &mut std::net::TcpStream,
                       mv: &Move,
                       chess_state: &mut ChessState) {
+    assert!(!chess_state.is_client);
     let good = chess_state.ingest_client_move(mv);
     let board =
         chess_representaiton_to_wire(&chess_state.chess_representation);
@@ -528,6 +571,21 @@ fn handle_client_move(stream: &mut std::net::TcpStream,
         };
         serde_json::to_writer(stream, &state).unwrap();
     }
+}
+
+fn send_client_move(stream: &mut std::net::TcpStream,
+                    chess_state: &mut ChessState) {
+    let UnsentNetMove::Unsent(mv) = chess_state.unsent_net_move else {
+        return
+    };
+
+    // If an unsent move has been created before the handshake marks the
+    // chess state as client state - something has gone terribly wrong.
+    assert!(chess_state.is_client);
+
+    chess_state.unsent_net_move = UnsentNetMove::None;
+    let send_move = ClientToServer::Move(mv);
+    serde_json::to_writer(stream, &send_move).unwrap();
 }
 
 fn synchronize_board_state(stream: &mut std::net::TcpStream,
@@ -634,13 +692,22 @@ fn main() {
                 for packet in &from_client_packets {
                     println!("[server] packet received {packet:#?}");
                     match packet {
-                        Packet::Handshake(_h) => {
-                            send_server_handshake(stream, &game_state
-                                                              .chess_state);
+                        Packet::Handshake(h) => {
+                            let is_white = h.server_color == White;
+                            game_state.host_is_white = is_white;
+                            let state = &game_state.chess_state;
+                            send_server_handshake(stream, state);
                         }
                         Packet::Data(d) => {
                             match d {
                                 ClientToServer::Move(m) => {
+                                    let white_turn = game_state
+                                        .chess_state
+                                        .is_white_turn;
+                                    if game_state.host_is_white == white_turn {
+                                        // It isn't the client's turn yet!
+                                        continue
+                                    }
                                     let s = &mut game_state.chess_state;
                                     handle_client_move(stream, m, s);
                                 },
@@ -660,31 +727,45 @@ fn main() {
             GameMode::Client(stream, poller) => {
                 let buffer_read = stream.read(&mut buffer).unwrap_or_default();
                 poller.feed(&buffer[0..buffer_read], &mut from_server_packets);
-                println!("read: {buffer_read}");
+                //println!("read: {buffer_read}");
                 for packet in &from_server_packets {
                     println!("[client] packet received {packet:#?}");
                     match packet {
                         Packet::Handshake(h) => {
+                            game_state.chess_state.is_client = true;
                             game_state.chess_state.chess_representation =
                                 wire_to_chess_representation(&h.board);
                         }
                         Packet::Data(d) => {
                             match d {
-                                ServerToClient::State{ board, .. }
-                                | ServerToClient::Draw { board, .. }
-                                | ServerToClient::Resigned { board, .. }
-                                | ServerToClient::Error { board, .. } => {
+                                ServerToClient::State
+                                    { board, joever, .. }
+                                | ServerToClient::Resigned
+                                    { board, joever, .. }
+                                | ServerToClient::Error
+                                    { board, joever, .. } => {
                                     game_state
                                         .chess_state
                                         .chess_representation =
                                         wire_to_chess_representation(&board);
+                                    let over = joever != &Joever::Ongoing;
+                                    game_state.chess_state.is_game_over = over;
+                                    game_state.chess_state.is_white_turn =
+                                        !game_state.chess_state.is_white_turn;
+                                }
+                                ServerToClient::Draw { board, .. } => {
+                                    game_state
+                                        .chess_state
+                                        .chess_representation =
+                                        wire_to_chess_representation(&board);
+                                    game_state.chess_state.is_game_over = true;
                                 }
                             };
                         }
                     }
                 }
                 from_server_packets.clear();
-
+                send_client_move(stream, &mut game_state.chess_state);
             }
             GameMode::Undecided(_) | GameMode::Local => {}
         }
@@ -764,7 +845,6 @@ mod tests {
         })]);
         into.clear();
         poller.feed(b"", &mut into);
-        assert!(false);
         assert_eq!(into, vec![]);
     }
 }
