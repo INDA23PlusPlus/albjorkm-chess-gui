@@ -5,7 +5,8 @@ use std::{io::Read, marker::PhantomData};
 
 use chess_network_protocol::{ClientToServerHandshake,
                              ClientToServer, ServerToClient,
-                             ServerToClientHandshake};
+                             ServerToClientHandshake,
+                             Piece};
 use glow::HasContext;
 use imgui::{Context, WindowFlags};
 use imgui_glow_renderer::AutoRenderer;
@@ -30,6 +31,56 @@ struct GameState {
     is_white_turn: bool,
     is_promoting: bool,
     mode: GameMode,
+}
+
+fn chess_representaiton_to_wire(data: &[(i8, i8); 64]) -> [[Piece; 8]; 8] {
+    let mut result = [[Piece::None; 8]; 8];
+    for i in 0..64 {
+        let square = data[i];
+        let row = i >> 3;
+        let column = i & 7;
+        result[7 - row][column] = match square {
+            (1, -1) => Piece::WhitePawn,
+            (2, -1) => Piece::WhiteRook,
+            (3, -1) => Piece::WhiteKnight,
+            (4, -1) => Piece::WhiteBishop,
+            (5, -1) => Piece::WhiteQueen,
+            (6, -1) => Piece::WhiteKing,
+            (1, 1) => Piece::BlackPawn,
+            (2, 1) => Piece::BlackRook,
+            (3, 1) => Piece::BlackKnight,
+            (4, 1) => Piece::BlackBishop,
+            (5, 1) => Piece::BlackQueen,
+            (6, 1) => Piece::BlackKing,
+            _ => Piece::None,
+        };
+    }
+    result
+}
+
+fn wire_to_chess_representation(data: &[[Piece; 8]; 8]) -> [(i8, i8); 64] {
+    let mut result = [(0, 0); 64];
+    for i in 0..64 {
+        let row = i >> 3;
+        let column = i & 7;
+        let square = data[7 - row][column];
+        result[i] = match square {
+            Piece::WhitePawn   => (1, -1),
+            Piece::WhiteRook   => (2, -1),
+            Piece::WhiteKnight => (3, -1),
+            Piece::WhiteBishop => (4, -1),
+            Piece::WhiteQueen  => (5, -1),
+            Piece::WhiteKing   => (6, -1),
+            Piece::BlackPawn   => (1, 1),
+            Piece::BlackRook   => (2, 1),
+            Piece::BlackKnight => (3, 1),
+            Piece::BlackBishop => (4, 1),
+            Piece::BlackQueen  => (5, 1),
+            Piece::BlackKing   => (6, 1),
+            _ => (0, 0),
+        }
+    }
+    result
 }
 
 impl GameState {
@@ -206,7 +257,14 @@ fn draw_ui(ui: &imgui::Ui, game_state: &mut GameState) {
                 };
                 println!("[client]attempting to connect to: {address}");
                 let stream = std::net::TcpStream::connect(address).unwrap();
-                stream.set_nonblocking(true);
+                stream.set_nonblocking(true).unwrap();
+
+                let handshake = ClientToServerHandshake {
+                    server_color: chess_network_protocol::Color::Black,
+                };
+                serde_json::to_writer(&stream, &handshake).unwrap();
+
+
                 game_state.mode = GameMode::Client(stream, JsonPoller::new());
                 return
             }
@@ -353,6 +411,20 @@ impl<Handshake: serde::de::DeserializeOwned, Data: serde::de::DeserializeOwned> 
     }
 }
 
+fn send_server_handshake(stream: &mut std::net::TcpStream,
+                         chess_representation: &[(i8, i8); 64]) {
+    let handshake = ServerToClientHandshake {
+        features: vec![
+            chess_network_protocol::Features::EnPassant,
+            chess_network_protocol::Features::Castling,
+            chess_network_protocol::Features::Promotion
+            ],
+        board: chess_representaiton_to_wire(chess_representation),
+        moves: vec![],
+        joever: chess_network_protocol::Joever::Ongoing,
+    };
+    serde_json::to_writer(stream, &handshake).unwrap();
+}
 
 fn main() {
     let sdl = sdl2::init().unwrap();
@@ -409,9 +481,6 @@ fn main() {
 
     let mut game_state = GameState::new_game();
 
-    //let mut stream = std::net::TcpStream::connect("127.0.0.1:8483").unwrap();
-    /*stream.set_nonblocking(true).unwrap();*/
-
     let mut buffer = [0u8; 65535];
 
     'main: loop {
@@ -435,6 +504,15 @@ fn main() {
                 let packets = poller.feed(&buffer[0..buffer_read]);
                 for packet in packets {
                     println!("[server] packet received {packet:#?}");
+                    match packet {
+                        Packet::Handshake(h) => {
+                            let c = &game_state.chess_representation;
+                            send_server_handshake(stream, c);
+                        }
+                        Packet::Data(d) => {
+
+                        }
+                    }
                 }
             }
             GameMode::Client(stream, poller) => {
@@ -442,6 +520,15 @@ fn main() {
                 let packets = poller.feed(&buffer[0..buffer_read]);
                 for packet in packets {
                     println!("[client] packet received {packet:#?}");
+                    match packet {
+                        Packet::Handshake(h) => {
+                            game_state.chess_representation =
+                                wire_to_chess_representation(&h.board);
+                        }
+                        Packet::Data(d) => {
+
+                        }
+                    }
                 }
 
             }
